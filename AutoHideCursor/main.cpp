@@ -15,13 +15,15 @@
 // Constants & globals
 // ==============================
 const wchar_t* APP_NAME = L"AutoHide Cursor";
-const wchar_t* APP_VERSION = L"v1.0.0";
+const wchar_t* APP_VERSION = L"v1.1.0";
 
 const wchar_t* REG_RUN_PATH = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* SETTINGS_PATH = L"SOFTWARE\\AutoHideCursor";
 const wchar_t* REG_ENABLED = L"Enabled";
 const wchar_t* REG_TIMEOUTMS = L"TimeoutMs";
 const wchar_t* REG_ICON_PATH = L"CustomIcon";
+const wchar_t* REG_HIDE_IBEAM = L"HideIBeam";
+const wchar_t* REG_HIDE_HAND = L"HideHand";
 
 HINSTANCE       g_hInstance = nullptr;
 HWND            g_hWnd = nullptr;
@@ -30,10 +32,14 @@ NOTIFYICONDATAW g_nid = { sizeof(NOTIFYICONDATAW) };
 
 bool        g_isStartup = false;
 bool        g_enabled = true;
+bool        g_hideIBeam = false;
+bool        g_hideHand = false;
 bool        g_cursorHidden = false;     // app state
 bool        g_sysCursorsHidden = false; // system cursors swapped?
 DWORD       g_timeoutMs = 10000;        // default 10s
 ULONGLONG   g_lastMouseTick = 0;
+POINT       g_lastCursorPos = { 0, 0 };
+bool        g_lastMouseButtonsDown = false;
 HHOOK       g_hMouseHook = nullptr;
 std::wstring g_customIconPath;
 
@@ -52,6 +58,8 @@ enum : UINT {
     ID_MI_TIMEOUT = 5,   // cycles 3/5/10/30/60s
     ID_MI_ABOUT = 6,
     ID_MI_EXIT = 7,
+    ID_MI_HIDE_IBEAM = 8,
+    ID_MI_HIDE_HAND = 9,
 };
 
 // timeouts cycled by menu item #5
@@ -72,6 +80,14 @@ static std::string WCharToString(const wchar_t* w) {
 
 static ULONGLONG NowMs() { return GetTickCount64(); }
 
+static bool IsAnyMouseButtonDown() {
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+}
+
 static bool IsTaskbarDarkMode() {
     HKEY hKey; DWORD v = 0, cb = sizeof(DWORD);
     if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -89,6 +105,10 @@ static void SaveSettings() {
     if (RegCreateKeyEx(HKEY_CURRENT_USER, SETTINGS_PATH, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
         DWORD en = g_enabled ? 1u : 0u;
         RegSetValueEx(hKey, REG_ENABLED, 0, REG_DWORD, (const BYTE*)&en, sizeof(en));
+        DWORD hideIBeam = g_hideIBeam ? 1u : 0u;
+        RegSetValueEx(hKey, REG_HIDE_IBEAM, 0, REG_DWORD, (const BYTE*)&hideIBeam, sizeof(hideIBeam));
+        DWORD hideHand = g_hideHand ? 1u : 0u;
+        RegSetValueEx(hKey, REG_HIDE_HAND, 0, REG_DWORD, (const BYTE*)&hideHand, sizeof(hideHand));
         RegSetValueEx(hKey, REG_TIMEOUTMS, 0, REG_DWORD, (const BYTE*)&g_timeoutMs, sizeof(g_timeoutMs));
         if (!g_customIconPath.empty()) {
             RegSetValueEx(hKey, REG_ICON_PATH, 0, REG_SZ, (const BYTE*)g_customIconPath.c_str(), (DWORD)((g_customIconPath.size() + 1) * sizeof(wchar_t)));
@@ -106,6 +126,14 @@ static void LoadSettings() {
         DWORD en = 1, to = g_timeoutMs, type = 0, cb = sizeof(DWORD);
         if (RegQueryValueEx(hKey, REG_ENABLED, nullptr, &type, (LPBYTE)&en, &cb) == ERROR_SUCCESS)
             g_enabled = (en != 0);
+        DWORD hIBeam = 0;
+        cb = sizeof(DWORD);
+        if (RegQueryValueEx(hKey, REG_HIDE_IBEAM, nullptr, &type, (LPBYTE)&hIBeam, &cb) == ERROR_SUCCESS)
+            g_hideIBeam = (hIBeam != 0);
+        DWORD hHand = 0;
+        cb = sizeof(DWORD);
+        if (RegQueryValueEx(hKey, REG_HIDE_HAND, nullptr, &type, (LPBYTE)&hHand, &cb) == ERROR_SUCCESS)
+            g_hideHand = (hHand != 0);
         cb = sizeof(DWORD);
         if (RegQueryValueEx(hKey, REG_TIMEOUTMS, nullptr, &type, (LPBYTE)&to, &cb) == ERROR_SUCCESS) {
             if (to >= 1000 && to <= 600000) g_timeoutMs = to;
@@ -185,15 +213,29 @@ static HCURSOR CreateBlankCursor()
         xorPlane.data());
 }
 
+static bool IsCurrentCursorHideable()
+{
+    CURSORINFO ci = { sizeof(CURSORINFO) };
+    if (!GetCursorInfo(&ci)) return true;
+    if (!(ci.flags & CURSOR_SHOWING)) return false;
+
+    HCURSOR hArrow = LoadCursor(nullptr, IDC_ARROW);
+    HCURSOR hIBeam = LoadCursor(nullptr, IDC_IBEAM);
+    HCURSOR hHand  = LoadCursor(nullptr, IDC_HAND);
+
+    if (ci.hCursor == hArrow) return true;
+    if (ci.hCursor == hIBeam) return g_hideIBeam;
+    if (ci.hCursor == hHand)  return g_hideHand;
+    return false;
+}
+
 static void HideSystemCursors()
 {
     if (g_sysCursorsHidden) return;
 
-    const int ids[] = {
-        OCR_NORMAL/*, OCR_IBEAM, OCR_WAIT, OCR_CROSS, OCR_UP,
-        OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS, OCR_SIZEALL,
-        OCR_NO, OCR_HAND, OCR_APPSTARTING*/
-    };
+    std::vector<int> ids = { OCR_NORMAL };
+    if (g_hideIBeam) ids.push_back(OCR_IBEAM);
+    if (g_hideHand)  ids.push_back(OCR_HAND);
 
     for (int id : ids) {
         HCURSOR hBlank = CreateBlankCursor();
@@ -206,8 +248,16 @@ static void HideSystemCursors()
 static void RestoreSystemCursors()
 {
     if (!g_sysCursorsHidden) return;
-    SystemParametersInfo(SPI_SETCURSORS, 0, nullptr, 0);
     g_sysCursorsHidden = false;
+    SystemParametersInfo(SPI_SETCURSORS, 0, nullptr, 0);
+    SendNotifyMessage(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETCURSORS, 0);
+    POINT pt;
+    if (GetCursorPos(&pt)) {
+        int dx = (pt.x > 0) ? -1 : 1;
+        SetCursorPos(pt.x + dx, pt.y);
+        SetCursorPos(pt.x, pt.y);
+        g_lastCursorPos = pt;
+    }
 }
 
 // ==============================
@@ -223,9 +273,9 @@ static void EnsureCursorHidden() {
 
 static void EnsureCursorVisible() {
     if (!g_cursorHidden) return;
+    g_cursorHidden = false;
     RestoreSystemCursors();
     for (int i = 0; i < 100; ++i) { if (ShowCursor(TRUE) >= 0) break; }
-    g_cursorHidden = false;
 }
 
 // ==============================
@@ -303,6 +353,8 @@ static void BuildMenuOnce() {
     AppendMenu(g_hMenu, MF_STRING, ID_MI_RESETICO, L"Reset Icon");
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(g_hMenu, MF_STRING, ID_MI_ENABLE, L"Enable Auto Hide");
+    AppendMenu(g_hMenu, MF_STRING, ID_MI_HIDE_IBEAM, L"Hide on Input (I-Beam)");
+    AppendMenu(g_hMenu, MF_STRING, ID_MI_HIDE_HAND, L"Hide on Buttons (Hand)");
     AppendMenu(g_hMenu, MF_STRING, ID_MI_TIMEOUT, L"Timeout: 10s"); // updated dynamically
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(g_hMenu, MF_STRING, ID_MI_ABOUT, L"About");
@@ -317,6 +369,9 @@ static void BuildMenuOnce() {
 // ==============================
 static LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && g_enabled) {
+        if (lParam) {
+            g_lastCursorPos = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam)->pt;
+        }
         switch (wParam) {
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN: case WM_LBUTTONUP:
@@ -350,6 +405,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_isStartup = IsStartupEnabled();
             CheckMenuItem(g_hMenu, ID_MI_STARTUP, MF_BYCOMMAND | (g_isStartup ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(g_hMenu, ID_MI_ENABLE, MF_BYCOMMAND | (g_enabled ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(g_hMenu, ID_MI_HIDE_IBEAM, MF_BYCOMMAND | (g_hideIBeam ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(g_hMenu, ID_MI_HIDE_HAND, MF_BYCOMMAND | (g_hideHand ? MF_CHECKED : MF_UNCHECKED));
             UpdateTimeoutMenuText();
 
             TrackPopupMenu(g_hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
@@ -370,6 +427,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_MI_ENABLE:
             g_enabled = !g_enabled;
             if (!g_enabled) EnsureCursorVisible();
+            SaveSettings();
+            break;
+        case ID_MI_HIDE_IBEAM:
+            g_hideIBeam = !g_hideIBeam;
+            if (g_cursorHidden) EnsureCursorVisible();
+            SaveSettings();
+            break;
+        case ID_MI_HIDE_HAND:
+            g_hideHand = !g_hideHand;
+            if (g_cursorHidden) EnsureCursorVisible();
             SaveSettings();
             break;
         case ID_MI_TIMEOUT:
@@ -395,14 +462,33 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_CREATE:
         CreateTrayIcon(hWnd);
-        SetTimer(hWnd, IDT_CHECK, 250, nullptr); // snappy heartbeat
+        SetTimer(hWnd, IDT_CHECK, 50, nullptr); // snappy heartbeat
         break;
 
     case WM_TIMER:
         if (wParam == IDT_CHECK && g_enabled) {
+            POINT pt;
+            if (GetCursorPos(&pt)) {
+                const bool moved = (pt.x != g_lastCursorPos.x || pt.y != g_lastCursorPos.y);
+                const bool buttonsDown = IsAnyMouseButtonDown();
+                const bool buttonChanged = (buttonsDown != g_lastMouseButtonsDown);
+                g_lastCursorPos = pt;
+                g_lastMouseButtonsDown = buttonsDown;
+
+                if (moved || buttonsDown || buttonChanged) {
+                    g_lastMouseTick = NowMs();
+                    if (g_cursorHidden) {
+                        EnsureCursorVisible();
+                    }
+                    break;
+                }
+            }
+
             const ULONGLONG idle = NowMs() - g_lastMouseTick;
             if (!g_cursorHidden && idle >= g_timeoutMs) {
-                EnsureCursorHidden();
+                if (IsCurrentCursorHideable()) {
+                    EnsureCursorHidden();
+                }
             }
         }
         break;
@@ -440,6 +526,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     LoadSettings();
     g_lastMouseTick = NowMs();
+    GetCursorPos(&g_lastCursorPos);
+    g_lastMouseButtonsDown = IsAnyMouseButtonDown();
 
     // hidden message window
     WNDCLASS wc = {};
