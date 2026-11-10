@@ -7,6 +7,7 @@
 #include <Commctrl.h>
 #include <string>
 #include <vector>
+#include <utility>
 
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -42,6 +43,7 @@ POINT       g_lastCursorPos = { 0, 0 };
 bool        g_lastMouseButtonsDown = false;
 HHOOK       g_hMouseHook = nullptr;
 std::wstring g_customIconPath;
+std::vector<std::pair<int, HCURSOR>> g_savedCursors;
 
 HICON hWhiteIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 HICON hBlackIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON2), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
@@ -216,7 +218,7 @@ static HCURSOR CreateBlankCursor()
 static bool IsCurrentCursorHideable()
 {
     CURSORINFO ci = { sizeof(CURSORINFO) };
-    if (!GetCursorInfo(&ci)) return true;
+    if (!GetCursorInfo(&ci)) return false;
     if (!(ci.flags & CURSOR_SHOWING)) return false;
 
     HCURSOR hArrow = LoadCursor(nullptr, IDC_ARROW);
@@ -238,6 +240,11 @@ static void HideSystemCursors()
     if (g_hideHand)  ids.push_back(OCR_HAND);
 
     for (int id : ids) {
+        HCURSOR hCur = LoadCursor(nullptr, MAKEINTRESOURCE(id));
+        if (hCur) {
+            HCURSOR hCopy = CopyIcon(hCur);
+            if (hCopy) g_savedCursors.push_back({ id, hCopy });
+        }
         HCURSOR hBlank = CreateBlankCursor();
         SetSystemCursor(hBlank, id); // takes ownership, no DestroyCursor needed
     }
@@ -249,8 +256,13 @@ static void RestoreSystemCursors()
 {
     if (!g_sysCursorsHidden) return;
     g_sysCursorsHidden = false;
+    for (auto& kv : g_savedCursors) {
+        if (kv.second) {
+            SetSystemCursor(kv.second, kv.first); // takes ownership
+        }
+    }
+    g_savedCursors.clear();
     SystemParametersInfo(SPI_SETCURSORS, 0, nullptr, 0);
-    SendNotifyMessage(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETCURSORS, 0);
     POINT pt;
     if (GetCursorPos(&pt)) {
         int dx = (pt.x > 0) ? -1 : 1;
@@ -468,20 +480,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == IDT_CHECK && g_enabled) {
             POINT pt;
-            if (GetCursorPos(&pt)) {
-                const bool moved = (pt.x != g_lastCursorPos.x || pt.y != g_lastCursorPos.y);
-                const bool buttonsDown = IsAnyMouseButtonDown();
-                const bool buttonChanged = (buttonsDown != g_lastMouseButtonsDown);
-                g_lastCursorPos = pt;
-                g_lastMouseButtonsDown = buttonsDown;
-
-                if (moved || buttonsDown || buttonChanged) {
-                    g_lastMouseTick = NowMs();
-                    if (g_cursorHidden) {
-                        EnsureCursorVisible();
-                    }
-                    break;
+            if (!GetCursorPos(&pt)) {
+                if (g_cursorHidden) {
+                    EnsureCursorVisible();
                 }
+                break;
+            }
+
+            const bool moved = (pt.x != g_lastCursorPos.x || pt.y != g_lastCursorPos.y);
+            const bool buttonsDown = IsAnyMouseButtonDown();
+            const bool buttonChanged = (buttonsDown != g_lastMouseButtonsDown);
+            g_lastCursorPos = pt;
+            g_lastMouseButtonsDown = buttonsDown;
+
+            if (moved || buttonsDown || buttonChanged) {
+                g_lastMouseTick = NowMs();
+                if (g_cursorHidden) {
+                    EnsureCursorVisible();
+                }
+                break;
             }
 
             const ULONGLONG idle = NowMs() - g_lastMouseTick;
@@ -525,8 +542,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 
     LoadSettings();
+    if (!GetCursorPos(&g_lastCursorPos)) {
+        SystemParametersInfo(SPI_SETCURSORS, 0, nullptr, 0);
+        return 0;
+    }
     g_lastMouseTick = NowMs();
-    GetCursorPos(&g_lastCursorPos);
     g_lastMouseButtonsDown = IsAnyMouseButtonDown();
 
     // hidden message window
