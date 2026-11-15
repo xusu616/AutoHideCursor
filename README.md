@@ -1,3 +1,5 @@
+> 📦 **Release 下载提示**：请前往对应的 GitLab 仓库查看或下载 Release（GitHub 端暂不重复上传）👉 [https://gitlab.com/xusu616/autohidecursor/-/releases](https://gitlab.com/xusu616/autohidecursor/-/releases) （[GitLab 仓库主页](https://gitlab.com/xusu616/autohidecursor)）
+
 # AutoHide Cursor 🖱️
 
 [![Latest Version](https://img.shields.io/github/v/release/emp0ry/AutoHideCursor?label=Latest%20Version&style=flat-square&color=8b5cf6)](https://github.com/emp0ry/AutoHideCursor/releases/latest)
